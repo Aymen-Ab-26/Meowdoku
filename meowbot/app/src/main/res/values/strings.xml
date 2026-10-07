@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Meowdoku Bot</string>
+    <string name="service_desc">Shows a floating button that reads the Meowdoku board, solves it and taps the answer.</string>
+</resources>
