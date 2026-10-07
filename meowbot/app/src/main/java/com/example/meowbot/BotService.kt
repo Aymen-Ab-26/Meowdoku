@@ -19,7 +19,6 @@ import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.TextView
-import android.widget.Toast
 import java.util.concurrent.Executors
 import kotlin.math.abs
 
@@ -34,6 +33,36 @@ class BotService : AccessibilityService() {
     private var wm: WindowManager? = null
     private var button: TextView? = null
     private var busy = false
+    private var banner: TextView? = null
+    private var diag = ""
+
+    /** On-screen message that stays ~6 s (toasts get suppressed on some phones). */
+    private fun showMessage(msg: String) {
+        main.post {
+            banner?.let { try { wm?.removeView(it) } catch (_: Exception) {} }
+            val tv = TextView(this).apply {
+                text = msg
+                textSize = 16f
+                setTextColor(Color.WHITE)
+                setPadding(32, 24, 32, 24)
+                setBackgroundColor(Color.argb(235, 30, 30, 30))
+            }
+            val lp = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                PixelFormat.TRANSLUCENT
+            ).apply { gravity = Gravity.TOP; y = 120 }
+            try { wm?.addView(tv, lp) } catch (_: Exception) { return@post }
+            banner = tv
+            main.postDelayed({
+                try { wm?.removeView(tv) } catch (_: Exception) {}
+                if (banner === tv) banner = null
+            }, 6000)
+        }
+    }
 
     override fun onServiceConnected() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -104,6 +133,7 @@ class BotService : AccessibilityService() {
     private fun onButtonTap() {
         if (busy) return
         busy = true
+        banner?.let { try { wm?.removeView(it) } catch (_: Exception) {}; banner = null }
         button?.visibility = View.INVISIBLE          // keep it out of the screenshot
         main.postDelayed({ capture() }, 250)
     }
@@ -112,20 +142,26 @@ class BotService : AccessibilityService() {
         busy = false
         main.post {
             if (gamePkg.isEmpty()) button?.visibility = View.VISIBLE
-            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
         }
+        showMessage(msg)
     }
 
     // ---------- screenshot ----------
     private fun capture() {
+        try { doCapture() } catch (e: Exception) { done("Capture error: ${e.javaClass.simpleName} ${e.message}") }
+    }
+
+    private fun doCapture() {
         takeScreenshot(Display.DEFAULT_DISPLAY, worker, object : TakeScreenshotCallback {
             override fun onSuccess(result: ScreenshotResult) {
                 val hw = result.hardwareBuffer
                 val bmp = Bitmap.wrapHardwareBuffer(hw, result.colorSpace)
                     ?.copy(Bitmap.Config.ARGB_8888, false)
                 hw.close()
-                if (bmp == null) { done("Screenshot failed"); return }
-                process(bmp)
+                if (bmp == null) { done("Screenshot failed (null bitmap)"); return }
+                try { process(bmp) } catch (e: Throwable) {
+                    done("Error: ${e.javaClass.simpleName} ${e.message}")
+                }
             }
 
             override fun onFailure(errorCode: Int) {
@@ -141,13 +177,16 @@ class BotService : AccessibilityService() {
         val px = IntArray(w * h)
         bmp.getPixels(px, 0, w, 0, 0, w, h)
 
-        val box = findBoard(px, w, h) ?: return done("Board not found")
-        val sized = detectSize(px, w, box) ?: return done("Couldn't read the board")
+        val box = findBoard(px, w, h) ?: return done("Board not found ($diag)")
+        val sized = detectSize(px, w, box) ?: return done(
+            "Couldn't read the board. Box=${box.toList()} screen=${w}x$h. Colors per size: " +
+                (4..12).joinToString(" ") { "$it:${readGrid(px, w, box, it).second}" }
+        )
         val n = sized.first
         val sol = solve(sized.second) ?: return done("No solution (colors misread?)")
 
         main.post {
-            Toast.makeText(this, "Found ${n}x$n board, solving…", Toast.LENGTH_SHORT).show()
+            showMessage("Found ${n}x$n board, solving…")
             tapCats(box, n, sol, 0)
         }
     }
@@ -187,7 +226,10 @@ class BotService : AccessibilityService() {
             c > w * 0.5
         }
         val (r0, r1) = longestRun(rowMask)
-        if (r1 - r0 < 100 || r1 - r0 > h * 0.9) return null
+        if (r1 - r0 < 100 || r1 - r0 > h * 0.9) {
+            diag = "rows $r0-$r1 of $h, bg=${bg.toList()}"
+            return null
+        }
 
         val colMask = BooleanArray(w) { x ->
             var c = 0
@@ -195,7 +237,10 @@ class BotService : AccessibilityService() {
             c > (r1 - r0) * 0.8
         }
         val (c0, c1) = longestRun(colMask)
-        if (c1 - c0 < 100) return null
+        if (c1 - c0 < 100) {
+            diag = "rows $r0-$r1, cols $c0-$c1 of $w"
+            return null
+        }
         return intArrayOf(c0, r0, c1, r1)
     }
 
