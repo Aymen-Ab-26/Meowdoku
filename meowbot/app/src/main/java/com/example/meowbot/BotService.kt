@@ -28,7 +28,7 @@ class BotService : AccessibilityService() {
     // Set to the game's package name to show it only while the game is open.
     private val gamePkg = ""
 
-    private val solvedWaitMs = 3500L    // after the last cat, before looking for the next-level button
+    private val solvedWaitMs = 3000L    // after the last cat, before looking for the next-level button
     private val nextWaitMs = 4500L      // after pressing next level / skip, before solving
     private val retryWaitMs = 3000L     // after a failed read, before trying again
     private val popupWaitMs = 800L      // after dismissing a popup
