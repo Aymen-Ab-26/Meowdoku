@@ -28,15 +28,47 @@ class BotService : AccessibilityService() {
     // Set to the game's package name to show it only while the game is open.
     private val gamePkg = ""
 
+    private val waitMs = 3000L          // pause on the win screen, and after pressing "next level"
+    private val maxFailures = 6         // consecutive failed reads before the loop stops itself
+
     private val main = Handler(Looper.getMainLooper())
+    private val loop = Handler(Looper.getMainLooper())   // timers for the auto-play loop
     private val worker = Executors.newSingleThreadExecutor()
     private var wm: WindowManager? = null
     private var button: TextView? = null
-    private var busy = false
     private var banner: TextView? = null
     private var diag = ""
+    private var lastError = ""
 
-    /** On-screen message that stays ~6 s (toasts get suppressed on some phones). */
+    @Volatile private var running = false
+    private var failures = 0
+    private var levelsDone = 0
+
+    class Solved(val box: IntArray, val n: Int, val sol: IntArray)
+
+    override fun onServiceConnected() {
+        wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        addButton()
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null || gamePkg.isEmpty()) return
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        val pkg = event.packageName?.toString() ?: return
+        if (pkg == packageName) return
+        button?.visibility = if (pkg == gamePkg) View.VISIBLE else View.GONE
+    }
+
+    override fun onInterrupt() {}
+
+    override fun onDestroy() {
+        running = false
+        loop.removeCallbacksAndMessages(null)
+        try { button?.let { wm?.removeView(it) } } catch (_: Exception) {}
+        super.onDestroy()
+    }
+
+    // ---------- on-screen message (toasts get suppressed on some phones) ----------
     private fun showMessage(msg: String) {
         main.post {
             banner?.let { try { wm?.removeView(it) } catch (_: Exception) {} }
@@ -64,24 +96,9 @@ class BotService : AccessibilityService() {
         }
     }
 
-    override fun onServiceConnected() {
-        wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        addButton()
-    }
-
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null || gamePkg.isEmpty()) return
-        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-        val pkg = event.packageName?.toString() ?: return
-        if (pkg == packageName) return
-        button?.visibility = if (pkg == gamePkg) View.VISIBLE else View.GONE
-    }
-
-    override fun onInterrupt() {}
-
-    override fun onDestroy() {
-        try { button?.let { wm?.removeView(it) } } catch (_: Exception) {}
-        super.onDestroy()
+    private fun clearMessage() {
+        banner?.let { try { wm?.removeView(it) } catch (_: Exception) {} }
+        banner = null
     }
 
     // ---------- floating button ----------
@@ -130,66 +147,172 @@ class BotService : AccessibilityService() {
         button = tv
     }
 
+    /** Tap once = start auto-play (solve, next level, repeat). Tap again (⏹) = stop. */
     private fun onButtonTap() {
-        if (busy) return
-        busy = true
-        banner?.let { try { wm?.removeView(it) } catch (_: Exception) {}; banner = null }
-        button?.visibility = View.INVISIBLE          // keep it out of the screenshot
-        main.postDelayed({ capture() }, 250)
+        if (running) {
+            stopLoop("Stopped after $levelsDone level(s)")
+            return
+        }
+        running = true
+        failures = 0
+        levelsDone = 0
+        button?.text = "⏹"
+        solveStep()
     }
 
-    private fun done(msg: String) {
-        busy = false
+    private fun stopLoop(msg: String) {
+        running = false
+        loop.removeCallbacksAndMessages(null)
         main.post {
-            if (gamePkg.isEmpty()) button?.visibility = View.VISIBLE
+            button?.text = "🐱"
+            button?.visibility = View.VISIBLE
         }
         showMessage(msg)
     }
 
-    // ---------- screenshot ----------
-    private fun capture() {
-        try { doCapture() } catch (e: Exception) { done("Capture error: ${e.javaClass.simpleName} ${e.message}") }
-    }
-
-    private fun doCapture() {
-        takeScreenshot(Display.DEFAULT_DISPLAY, worker, object : TakeScreenshotCallback {
-            override fun onSuccess(result: ScreenshotResult) {
-                val hw = result.hardwareBuffer
-                val bmp = Bitmap.wrapHardwareBuffer(hw, result.colorSpace)
-                    ?.copy(Bitmap.Config.ARGB_8888, false)
-                hw.close()
-                if (bmp == null) { done("Screenshot failed (null bitmap)"); return }
-                try { process(bmp) } catch (e: Throwable) {
-                    done("Error: ${e.javaClass.simpleName} ${e.message}")
+    // ---------- the loop: solve -> wait -> next level -> wait -> solve ... ----------
+    private fun solveStep() {
+        if (!running) return
+        clearMessage()
+        button?.visibility = View.INVISIBLE          // keep it out of the screenshot
+        loop.postDelayed({
+            if (!running) return@postDelayed
+            grab { bmp, err ->
+                main.post { if (running) button?.visibility = View.VISIBLE }
+                if (!running) return@grab
+                if (bmp == null) {
+                    main.post { retryOrStop("Screenshot failed ($err)") }
+                    return@grab
+                }
+                val res = try { analyze(bmp) } catch (e: Throwable) {
+                    lastError = "Error: ${e.javaClass.simpleName} ${e.message}"
+                    null
+                }
+                main.post {
+                    if (!running) return@post
+                    if (res == null) {
+                        retryOrStop(lastError)
+                    } else {
+                        failures = 0
+                        showMessage("Level ${levelsDone + 1}: ${res.n}x${res.n} board, solving…")
+                        tapCats(res.box, res.n, res.sol, 0)
+                    }
                 }
             }
+        }, 250)
+    }
 
-            override fun onFailure(errorCode: Int) {
-                done("Screenshot failed (code $errorCode)")
+    private fun retryOrStop(msg: String) {
+        failures++
+        if (failures >= maxFailures) {
+            stopLoop("$msg\n(stopped after $maxFailures tries)")
+            return
+        }
+        showMessage("$msg\nRetrying in 3 s…")
+        loop.postDelayed({ solveStep() }, waitMs)
+    }
+
+    private fun afterSolved() {
+        levelsDone++
+        showMessage("Level $levelsDone solved 🐱 waiting 3 s")
+        loop.postDelayed({ findNext(0) }, waitMs)
+    }
+
+    private fun findNext(attempt: Int) {
+        if (!running) return
+        grab { bmp, err ->
+            if (!running) return@grab
+            val pt = if (bmp != null) {
+                try { findNextButton(bmp) } catch (_: Throwable) { null }
+            } else null
+            main.post {
+                if (!running) return@post
+                if (pt == null) {
+                    if (attempt >= 4) stopLoop("Next-level button not found ${err ?: ""}")
+                    else loop.postDelayed({ findNext(attempt + 1) }, 2000)
+                } else {
+                    tapOnce(pt[0].toFloat(), pt[1].toFloat()) {
+                        showMessage("Next level… waiting 3 s")
+                        loop.postDelayed({ solveStep() }, waitMs)
+                    }
+                }
             }
-        })
+        }
+    }
+
+    // ---------- screenshot ----------
+    /** Calls back on a worker thread with the screenshot, or null plus a reason. */
+    private fun grab(onResult: (Bitmap?, String?) -> Unit) {
+        try {
+            takeScreenshot(Display.DEFAULT_DISPLAY, worker, object : TakeScreenshotCallback {
+                override fun onSuccess(result: ScreenshotResult) {
+                    val hw = result.hardwareBuffer
+                    val bmp = Bitmap.wrapHardwareBuffer(hw, result.colorSpace)
+                        ?.copy(Bitmap.Config.ARGB_8888, false)
+                    hw.close()
+                    onResult(bmp, if (bmp == null) "null bitmap" else null)
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    onResult(null, "code $errorCode")
+                }
+            })
+        } catch (e: Exception) {
+            onResult(null, "${e.javaClass.simpleName} ${e.message}")
+        }
     }
 
     // ---------- detect + solve ----------
-    private fun process(bmp: Bitmap) {
+    private fun analyze(bmp: Bitmap): Solved? {
         val w = bmp.width
         val h = bmp.height
         val px = IntArray(w * h)
         bmp.getPixels(px, 0, w, 0, 0, w, h)
 
-        val box = findBoard(px, w, h) ?: return done("Board not found ($diag)")
-        val rd = readAndSolve(px, w, box) ?: return done(
-            "Couldn't read/solve. Box=${box.toList()} screen=${w}x$h. Colors per size: " +
-                (4..12).joinToString(" ") { "$it:${readGrid(px, w, box, it, 30, 0.16, 0.5).second}" } +
-                "\n" + readGrid(px, w, box, 10, 30, 0.16, 0.5).first.joinToString("/")
-        )
-        val n = rd.n
-        val sol = rd.sol
-
-        main.post {
-            showMessage("Found ${n}x$n board, solving…")
-            tapCats(box, n, sol, 0)
+        val box = findBoard(px, w, h) ?: run {
+            lastError = "Board not found ($diag)"
+            return null
         }
+        val rd = readAndSolve(px, w, box) ?: run {
+            lastError = "Couldn't read/solve. Box=${box.toList()} screen=${w}x$h. Colors per size: " +
+                (4..12).joinToString(" ") { "$it:${readGrid(px, w, box, it, 30, 0.16, 0.5).second}" }
+            return null
+        }
+        return Solved(box, rd.n, rd.sol)
+    }
+
+    /** Win screen = dark overlay + a big orange pill button. Returns its centre, or null. */
+    private fun findNextButton(bmp: Bitmap): IntArray? {
+        val w = bmp.width
+        val h = bmp.height
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, 0, 0, w, h)
+
+        val bgp = px[(h / 2) * w + 4]
+        if (ch(bgp, 16) + ch(bgp, 8) + ch(bgp, 0) > 250) return null   // game screen is light, win screen is dark
+
+        fun orange(p: Int): Boolean {
+            val r = ch(p, 16); val g = ch(p, 8); val b = ch(p, 0)
+            return r > 200 && g in 120..190 && b < 100 && r - b > 120
+        }
+
+        val rowMask = BooleanArray(h) { y ->
+            var c = 0
+            for (x in 0 until w) if (orange(px[y * w + x])) c++
+            c > w * 0.35
+        }
+        val (r0, r1) = longestRun(rowMask, 0)
+        if (r1 - r0 < 60) return null
+
+        val y = (r0 + r1) / 2
+        val topY = r0 + (r1 - r0) / 6                     // top slice: no label text in the way
+        val xs = ArrayList<Int>()
+        for (x in 0 until w) if (orange(px[topY * w + x])) xs.add(x)
+        if (xs.size < w * 0.3) return null
+        xs.sort()
+        val left = xs[xs.size * 5 / 100]
+        val right = xs[xs.size * 95 / 100]
+        return intArrayOf((left + right) / 2, y)
     }
 
     private fun ch(p: Int, shift: Int) = (p shr shift) and 0xFF
@@ -326,7 +449,8 @@ class BotService : AccessibilityService() {
 
     // ---------- tapping ----------
     private fun tapCats(box: IntArray, n: Int, sol: IntArray, i: Int) {
-        if (i >= n) { done("Solved! 🐱"); return }
+        if (!running) return
+        if (i >= n) { afterSolved(); return }
         val x = (box[0] + (sol[i] + 0.46) * pitchX(box, n)).toFloat()
         val y = (box[1] + (i + 0.46) * pitchY(box, n)).toFloat()
 
@@ -340,11 +464,24 @@ class BotService : AccessibilityService() {
 
         dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
-                main.postDelayed({ tapCats(box, n, sol, i + 1) }, 250)
+                loop.postDelayed({ tapCats(box, n, sol, i + 1) }, 250)
             }
 
             override fun onCancelled(gestureDescription: GestureDescription?) {
-                done("Tap cancelled")
+                stopLoop("Tap cancelled")
+            }
+        }, null)
+    }
+
+    private fun tapOnce(x: Float, y: Float, then: () -> Unit) {
+        val p = Path().apply { moveTo(x, y) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p, 0, 60))
+            .build()
+        dispatchGesture(gesture, object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) { then() }
+            override fun onCancelled(gestureDescription: GestureDescription?) {
+                stopLoop("Tap cancelled")
             }
         }, null)
     }
