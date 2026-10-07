@@ -193,18 +193,22 @@ class BotService : AccessibilityService() {
 
     private fun ch(p: Int, shift: Int) = (p shr shift) and 0xFF
 
-    private fun longestRun(mask: BooleanArray): Pair<Int, Int> {
-        var best = Pair(0, 0)
+    /** Longest run of true, treating gaps of up to maxGap false values as part of the run. */
+    private fun longestRun(mask: BooleanArray, maxGap: Int): Pair<Int, Int> {
+        val runs = ArrayList<IntArray>()
         var start = -1
         for (i in 0..mask.size) {
             val v = i < mask.size && mask[i]
             if (v && start < 0) start = i
-            else if (!v && start >= 0) {
-                if (i - start > best.second - best.first) best = Pair(start, i)
-                start = -1
-            }
+            else if (!v && start >= 0) { runs.add(intArrayOf(start, i)); start = -1 }
         }
-        return best
+        val merged = ArrayList<IntArray>()
+        for (r in runs) {
+            if (merged.isNotEmpty() && r[0] - merged.last()[1] <= maxGap) merged.last()[1] = r[1]
+            else merged.add(r)
+        }
+        val best = merged.maxByOrNull { it[1] - it[0] } ?: return Pair(0, 0)
+        return Pair(best[0], best[1])
     }
 
     /** Board = biggest block that differs from the page background. */
@@ -225,7 +229,8 @@ class BotService : AccessibilityService() {
             for (x in 0 until w) if (differs(x, y)) c++
             c > w * 0.5
         }
-        val (r0, r1) = longestRun(rowMask)
+        val gap = (w * 0.017).toInt()
+        val (r0, r1) = longestRun(rowMask, gap)
         if (r1 - r0 < 100 || r1 - r0 > h * 0.9) {
             diag = "rows $r0-$r1 of $h, bg=${bg.toList()}"
             return null
@@ -234,9 +239,9 @@ class BotService : AccessibilityService() {
         val colMask = BooleanArray(w) { x ->
             var c = 0
             for (y in r0 until r1) if (differs(x, y)) c++
-            c > (r1 - r0) * 0.8
+            c > (r1 - r0) * 0.5
         }
-        val (c0, c1) = longestRun(colMask)
+        val (c0, c1) = longestRun(colMask, gap)
         if (c1 - c0 < 100) {
             diag = "rows $r0-$r1, cols $c0-$c1 of $w"
             return null
@@ -244,12 +249,16 @@ class BotService : AccessibilityService() {
         return intArrayOf(c0, r0, c1, r1)
     }
 
+    // Cells have ~8.5% gaps: board width = n*pitch - gap  =>  pitch = width / (n - 0.085)
+    private fun pitchX(box: IntArray, n: Int) = (box[2] - box[0]) / (n - 0.085)
+    private fun pitchY(box: IntArray, n: Int) = (box[3] - box[1]) / (n - 0.085)
+
     private fun cellColor(px: IntArray, w: Int, box: IntArray, n: Int, r: Int, c: Int): IntArray {
-        val cw = (box[2] - box[0]).toDouble() / n
-        val chh = (box[3] - box[1]).toDouble() / n
-        val cx = (box[0] + (c + 0.28) * cw).toInt()      // near top-left: avoids the cat icon
-        val cy = (box[1] + (r + 0.28) * chh).toInt()
-        val hh = maxOf(2, (minOf(cw, chh) * 0.06).toInt())
+        val pw = pitchX(box, n)
+        val ph = pitchY(box, n)
+        val cx = (box[0] + c * pw + 0.16 * pw).toInt()   // left-middle: clear of X marks and cat icon
+        val cy = (box[1] + r * ph + 0.5 * ph).toInt()
+        val hh = maxOf(2, (pw * 0.04).toInt())
         val chans = Array(3) { ArrayList<Int>() }
         for (y in cy - hh until cy + hh) for (x in cx - hh until cx + hh) {
             val p = px[y * w + x]
@@ -309,10 +318,8 @@ class BotService : AccessibilityService() {
     // ---------- tapping ----------
     private fun tapCats(box: IntArray, n: Int, sol: IntArray, i: Int) {
         if (i >= n) { done("Solved! 🐱"); return }
-        val cw = (box[2] - box[0]).toFloat() / n
-        val chh = (box[3] - box[1]).toFloat() / n
-        val x = box[0] + (sol[i] + 0.5f) * cw
-        val y = box[1] + (i + 0.5f) * chh
+        val x = (box[0] + (sol[i] + 0.46) * pitchX(box, n)).toFloat()
+        val y = (box[1] + (i + 0.46) * pitchY(box, n)).toFloat()
 
         // the game wants a double-tap: two short taps 130 ms apart
         val p1 = Path().apply { moveTo(x, y) }
