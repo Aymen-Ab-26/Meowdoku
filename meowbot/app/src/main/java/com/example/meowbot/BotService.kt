@@ -178,12 +178,13 @@ class BotService : AccessibilityService() {
         bmp.getPixels(px, 0, w, 0, 0, w, h)
 
         val box = findBoard(px, w, h) ?: return done("Board not found ($diag)")
-        val sized = detectSize(px, w, box) ?: return done(
-            "Couldn't read the board. Box=${box.toList()} screen=${w}x$h. Colors per size: " +
-                (4..12).joinToString(" ") { "$it:${readGrid(px, w, box, it).second}" }
+        val rd = readAndSolve(px, w, box) ?: return done(
+            "Couldn't read/solve. Box=${box.toList()} screen=${w}x$h. Colors per size: " +
+                (4..12).joinToString(" ") { "$it:${readGrid(px, w, box, it, 30, 0.16, 0.5).second}" } +
+                "\n" + readGrid(px, w, box, 10, 30, 0.16, 0.5).first.joinToString("/")
         )
-        val n = sized.first
-        val sol = solve(sized.second) ?: return done("No solution (colors misread?)")
+        val n = rd.n
+        val sol = rd.sol
 
         main.post {
             showMessage("Found ${n}x$n board, solving…")
@@ -253,11 +254,11 @@ class BotService : AccessibilityService() {
     private fun pitchX(box: IntArray, n: Int) = (box[2] - box[0]) / (n - 0.085)
     private fun pitchY(box: IntArray, n: Int) = (box[3] - box[1]) / (n - 0.085)
 
-    private fun cellColor(px: IntArray, w: Int, box: IntArray, n: Int, r: Int, c: Int): IntArray {
+    private fun cellColor(px: IntArray, w: Int, box: IntArray, n: Int, r: Int, c: Int, ox: Double, oy: Double): IntArray {
         val pw = pitchX(box, n)
         val ph = pitchY(box, n)
-        val cx = (box[0] + c * pw + 0.16 * pw).toInt()   // left-middle: clear of X marks and cat icon
-        val cy = (box[1] + r * ph + 0.5 * ph).toInt()
+        val cx = (box[0] + c * pw + ox * pw).toInt()
+        val cy = (box[1] + r * ph + oy * ph).toInt()
         val hh = maxOf(2, (pw * 0.04).toInt())
         val chans = Array(3) { ArrayList<Int>() }
         for (y in cy - hh until cy + hh) for (x in cx - hh until cx + hh) {
@@ -267,15 +268,15 @@ class BotService : AccessibilityService() {
         return IntArray(3) { chans[it].sort(); chans[it][chans[it].size / 2] }
     }
 
-    private fun readGrid(px: IntArray, w: Int, box: IntArray, n: Int): Pair<List<String>, Int> {
+    private fun readGrid(px: IntArray, w: Int, box: IntArray, n: Int, tol: Int, ox: Double, oy: Double): Pair<List<String>, Int> {
         val centers = ArrayList<IntArray>()
         val grid = ArrayList<String>()
         for (r in 0 until n) {
             val sb = StringBuilder()
             for (c in 0 until n) {
-                val col = cellColor(px, w, box, n, r, c)
+                val col = cellColor(px, w, box, n, r, c, ox, oy)
                 var idx = centers.indexOfFirst {
-                    abs(it[0] - col[0]) + abs(it[1] - col[1]) + abs(it[2] - col[2]) < 30
+                    abs(it[0] - col[0]) + abs(it[1] - col[1]) + abs(it[2] - col[2]) < tol
                 }
                 if (idx < 0) { centers.add(col); idx = centers.size - 1 }
                 sb.append('A' + idx)
@@ -285,11 +286,19 @@ class BotService : AccessibilityService() {
         return Pair(grid, centers.size)
     }
 
-    /** Try N = 4..12; only the true size gives exactly N distinct colors. */
-    private fun detectSize(px: IntArray, w: Int, box: IntArray): Pair<Int, List<String>>? {
-        for (n in 4..12) {
-            val (grid, k) = readGrid(px, w, box, n)
-            if (k == n) return Pair(n, grid)
+    class Reading(val n: Int, val grid: List<String>, val sol: IntArray)
+
+    /** Try several sampling spots / color tolerances; accept the first size N that gives
+     *  exactly N colors AND a solvable puzzle. */
+    private fun readAndSolve(px: IntArray, w: Int, box: IntArray): Reading? {
+        val spots = listOf(Pair(0.16, 0.5), Pair(0.5, 0.16), Pair(0.84, 0.5), Pair(0.5, 0.84))
+        for ((ox, oy) in spots) for (tol in intArrayOf(30, 20, 45, 60, 12)) {
+            for (n in 4..12) {
+                val (grid, k) = readGrid(px, w, box, n, tol, ox, oy)
+                if (k != n) continue
+                val sol = solve(grid) ?: continue
+                return Reading(n, grid, sol)
+            }
         }
         return null
     }
