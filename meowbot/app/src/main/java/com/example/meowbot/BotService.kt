@@ -28,7 +28,7 @@ class BotService : AccessibilityService() {
     // Set to the game's package name to show it only while the game is open.
     private val gamePkg = ""
 
-    private val solvedWaitMs = 4000L    // after the last cat, before looking for the next-level button
+    private val solvedWaitMs = 3500L    // after the last cat, before looking for the next-level button
     private val nextWaitMs = 4500L      // after pressing next level / skip, before solving
     private val retryWaitMs = 3000L     // after a failed read, before trying again
     private val popupWaitMs = 800L      // after dismissing a popup
@@ -209,7 +209,10 @@ class BotService : AccessibilityService() {
                 try {
                     val px = pixelsOf(bmp)
                     solved = analyze(px, w, h)
-                    if (solved == null) act = findScreenAction(px, w, h)   // popup / menu instead of a board?
+                    if (solved == null) {
+                        act = findScreenAction(px, w, h)   // popup / menu instead of a board?
+                        if (act == null) lastError += "\n$screenDiag"
+                    }
                 } catch (e: Throwable) {
                     lastError = "Error: ${e.javaClass.simpleName} ${e.message}"
                 }
@@ -274,14 +277,16 @@ class BotService : AccessibilityService() {
             if (!running) return@grab
             var act: ScreenAction? = null
             if (bmp != null) {
-                try { act = findScreenAction(pixelsOf(bmp), bmp.width, bmp.height) } catch (_: Throwable) {}
+                try { act = findScreenAction(pixelsOf(bmp), bmp.width, bmp.height) } catch (e: Throwable) {
+                    screenDiag = "error ${e.javaClass.simpleName} ${e.message}"
+                }
                 bmp.recycle()
             }
             main.post {
                 if (!running) return@post
                 val a = act
                 if (a == null) {
-                    if (attempt >= 4) stopLoop("Next-level button not found ${err ?: ""}")
+                    if (attempt >= 4) stopLoop("Next-level button not found ${err ?: ""}\n$screenDiag")
                     else loop.postDelayed({ findNext(attempt + 1) }, 2000)
                 } else {
                     pressScreenAction(a)
@@ -543,8 +548,23 @@ class BotService : AccessibilityService() {
 
     // ---------- non-board screens: next level / skip / popups / out of fishes ----------
     private fun pillColor(kind: Int, r: Int, g: Int, b: Int): Boolean =
-        if (kind == 0) r > 205 && g in 125..172 && b in 35..90 && r - b > 130     // orange button
+        if (kind == 0) r > 200 && g in 120..215 && b < 110 && r - g > 15 && r - b > 120   // orange / gold button
         else r in 195..240 && g in 215..250 && b in 238..255 && b - r > 15       // light-blue "Restart"
+
+    /** Lowest run of at least minLen true values: [start, end) or null. */
+    private fun lowestRun(mask: BooleanArray, minLen: Int): IntArray? {
+        var best: IntArray? = null
+        var start = -1
+        for (i in 0..mask.size) {
+            val v = i < mask.size && mask[i]
+            if (v && start < 0) start = i
+            else if (!v && start >= 0) {
+                if (i - start >= minLen) best = intArrayOf(start, i)
+                start = -1
+            }
+        }
+        return best
+    }
 
     /** Big pill-shaped button of the given colour: returns [left, top, right, bottom] or null. */
     private fun findPill(px: IntArray, w: Int, h: Int, kind: Int): IntArray? {
@@ -559,8 +579,9 @@ class BotService : AccessibilityService() {
             }
             c * 3 > w * 0.35
         }
-        val (r0, r1) = longestRun(rowMask, 0)
-        if (r1 - r0 < 60) return null
+        val run = lowestRun(rowMask, 60) ?: return null
+        val r0 = run[0]
+        val r1 = run[1]
 
         val topY = r0 + (r1 - r0) / 6                     // top slice: no label text in the way
         val xs = IntArray(w)
@@ -573,49 +594,94 @@ class BotService : AccessibilityService() {
         return intArrayOf(xs[m * 5 / 100], r0, xs[m * 95 / 100], r1)
     }
 
-    /** Small light text under the next-level pill ("Skip to level XX"): returns its centre or null. */
+    /**
+     * The win screen is uniformly dark below its button, so ANY visible line of text there
+     * (e.g. "Skip to level XX") shows up as bright pixels. Returns the centre of that line.
+     */
     private fun findSkip(px: IntArray, w: Int, h: Int, pillBottom: Int): IntArray? {
-        var count = 0
-        var sumX = 0L
-        var sumY = 0L
-        var y = pillBottom + 10
-        val yEnd = minOf(h, pillBottom + 300)
-        while (y < yEnd) {
-            var x = (w * 0.1).toInt()
-            val xEnd = (w * 0.9).toInt()
-            while (x < xEnd) {
+        val y0 = pillBottom + 12
+        val y1 = minOf(h, pillBottom + 450)
+        if (y1 - y0 < 20) return null
+        val x0 = (w * 0.05).toInt()
+        val x1 = (w * 0.95).toInt()
+        val rowCnt = IntArray(y1 - y0)
+        var total = 0
+        for (y in y0 until y1) {
+            var c = 0
+            var x = x0
+            while (x < x1) {
                 val p = px[y * w + x]
-                val r = ch(p, 16); val g = ch(p, 8); val b = ch(p, 0)
-                if (minOf(r, g, b) > 180 && maxOf(r, g, b) - minOf(r, g, b) < 50) {
-                    count++; sumX += x; sumY += y
-                }
+                if (maxOf(ch(p, 16), ch(p, 8), ch(p, 0)) > 100) c++
                 x += 2
             }
-            y += 2
+            rowCnt[y - y0] = c
+            total += c
         }
-        if (count < 150) return null
-        return intArrayOf((sumX / count).toInt(), (sumY / count).toInt())
+        if (total < 80) return null
+
+        // group bright rows into lines (rows closer than 8 px belong together); keep the biggest line
+        var bestStart = -1; var bestEnd = -1; var bestSum = 0
+        var i = 0
+        while (i < rowCnt.size) {
+            if (rowCnt[i] == 0) { i++; continue }
+            val st = i
+            var last = i
+            var sum = 0
+            while (i < rowCnt.size && i - last <= 8) {
+                if (rowCnt[i] > 0) { sum += rowCnt[i]; last = i }
+                i++
+            }
+            if (sum > bestSum) { bestSum = sum; bestStart = st; bestEnd = last }
+        }
+        if (bestStart < 0 || bestEnd - bestStart > 90) return null
+
+        val xs = ArrayList<Int>()
+        for (y in (y0 + bestStart)..(y0 + bestEnd)) {
+            var x = x0
+            while (x < x1) {
+                val p = px[y * w + x]
+                if (maxOf(ch(p, 16), ch(p, 8), ch(p, 0)) > 100) xs.add(x)
+                x += 2
+            }
+        }
+        if (xs.size < 40) return null
+        xs.sort()
+        val left = xs[xs.size * 5 / 100]
+        val right = xs[xs.size * 95 / 100]
+        if (right - left < 100) return null                 // too narrow to be a text line (confetti etc.)
+        return intArrayOf((left + right) / 2, y0 + (bestStart + bestEnd) / 2)
     }
+
+    private var screenDiag = ""
 
     private fun findScreenAction(px: IntArray, w: Int, h: Int): ScreenAction? {
         val lm = px[(h / 2) * w + 5]
-        val darkScreen = ch(lm, 16) + ch(lm, 8) + ch(lm, 0) < 250      // win screen has a dark overlay
+        val lmSum = ch(lm, 16) + ch(lm, 8) + ch(lm, 0)
+        screenDiag = "leftmid=$lmSum"
+        // win screens, popups and "Out of Fishes" all dim the whole screen; a normal board is light
+        if (lmSum > 450) { screenDiag += " (bright screen)"; return null }
 
         val o = findPill(px, w, h, 0)
         if (o != null) {
             val cx = (o[0] + o[2]) / 2
             val cy = (o[1] + o[3]) / 2
+            screenDiag += " orange=[${o[0]},${o[1]},${o[2]},${o[3]}]"
             // a popup card is cream-coloured just above its button; the win screen is dark there
             val above = px[maxOf(0, o[1] - 30) * w + o[0] + 20]
             if (minOf(ch(above, 16), ch(above, 8), ch(above, 0)) > 235) return ScreenAction(cx, cy, kPopup)
-            if (darkScreen) {
-                val sk = findSkip(px, w, h, o[3])
-                if (sk != null) return ScreenAction(sk[0], sk[1], kSkip)   // golden-fish level: skip it
+            val sk = findSkip(px, w, h, o[3])
+            if (sk != null) {
+                screenDiag += " skip=[${sk[0]},${sk[1]}]"
+                return ScreenAction(sk[0], sk[1], kSkip)      // golden-fish level: skip it
             }
             return ScreenAction(cx, cy, kNext)
         }
         val b = findPill(px, w, h, 1)
-        if (b != null) return ScreenAction((b[0] + b[2]) / 2, (b[1] + b[3]) / 2, kRestart)
+        if (b != null) {
+            screenDiag += " restart=[${b[0]},${b[1]},${b[2]},${b[3]}]"
+            return ScreenAction((b[0] + b[2]) / 2, (b[1] + b[3]) / 2, kRestart)
+        }
+        screenDiag += " (no button found)"
         return null
     }
 
