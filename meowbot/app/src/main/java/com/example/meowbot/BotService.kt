@@ -28,7 +28,7 @@ class BotService : AccessibilityService() {
     // Set to the game's package name to show it only while the game is open.
     private val gamePkg = ""
 
-    private val waitMs = 3000L          // pause on the win screen, and after pressing "next level"
+    private val waitMs = 4000L          // pause on the win screen, and after pressing "next level"
     private val maxFailures = 6         // consecutive failed reads before the loop stops itself
 
     private val main = Handler(Looper.getMainLooper())
@@ -214,7 +214,7 @@ class BotService : AccessibilityService() {
 
     private fun afterSolved() {
         levelsDone++
-        showMessage("Level $levelsDone solved 🐱 waiting 3 s")
+        showMessage("Level $levelsDone solved 🐱 waiting 4 s")
         loop.postDelayed({ findNext(0) }, waitMs)
     }
 
@@ -232,7 +232,7 @@ class BotService : AccessibilityService() {
                     else loop.postDelayed({ findNext(attempt + 1) }, 2000)
                 } else {
                     tapOnce(pt[0].toFloat(), pt[1].toFloat()) {
-                        showMessage("Next level… waiting 3 s")
+                        showMessage("Next level… waiting 4 s")
                         loop.postDelayed({ solveStep() }, waitMs)
                     }
                 }
